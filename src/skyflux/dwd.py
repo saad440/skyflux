@@ -21,6 +21,7 @@ ARCHIVE_ROOT = (
 STATION_LIST_NAME = "zehn_min_sd_Beschreibung_Stationen.txt"
 FACTOR_JCM2_TO_WM2 = 10000.0 / 600.0
 FIRST_YEAR, LAST_YEAR = 2020, 2025
+USER_AGENT = "skyflux/0.1"
 
 
 def download(url: str, destination: Path) -> None:
@@ -34,7 +35,7 @@ def download(url: str, destination: Path) -> None:
     if destination.is_file():
         return
     temp = destination.with_name(destination.name + ".part")
-    request = urllib.request.Request(url, headers={"User-Agent": "SkyFlux-research/0.1"})
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(request, timeout=90) as response, temp.open("wb") as out:
             import shutil
@@ -61,6 +62,10 @@ def extract_station_metadata(file_contents: bytes, station_id: str) -> dict:
         r"^\s*(\d{5})\s+(\d{8})\s+(\d{8})\s+(-?\d+)\s+"
         r"(-?\d+[.,]\d+)\s+(-?\d+[.,]\d+)\s+(.+)$"
     )
+    # The 10-minute solar station list publishes one row per station. If DWD
+    # ever publishes per-period rows (as some other DWD station lists do), the
+    # first matching row is returned without checking its period against the
+    # analysis window.
     for line in decoded.splitlines():
         match = pattern.match(line)
         if match and match.group(1) == station_id:
@@ -78,18 +83,35 @@ def extract_station_metadata(file_contents: bytes, station_id: str) -> dict:
     raise ValueError(f"Station {station_id} missing/unparseable in DWD station list")
 
 
-def discover_archive(station_id: str, listing_html: str) -> str:
-    """Select a single archive including 2020-01-01 through 2025-12-31."""
+def discover_archive(
+    station_id: str,
+    listing_html: str,
+    first_year: int = FIRST_YEAR,
+    last_year: int = LAST_YEAR,
+) -> str:
+    """Return the archive filename whose data range spans the whole window.
+
+    ``listing_html`` is the CDC directory-listing page. An archive qualifies
+    when its filename-encoded start date (YYYYMMDD) is on or before
+    1 January of ``first_year`` and its end date is on or after
+    31 December of ``last_year``. Among qualifying archives the
+    lexicographically first filename is returned. Raises ``ValueError`` when
+    no single archive covers the window.
+    """
+    window_start = f"{first_year:04d}0101"
+    window_end = f"{last_year:04d}1231"
     names = re.findall(
         rf"10minutenwerte_SOLAR_{re.escape(station_id)}_(\d{{8}})_(\d{{8}})_hist\.zip",
         listing_html,
     )
     candidates = [
         f"10minutenwerte_SOLAR_{station_id}_{a}_{b}_hist.zip"
-        for a, b in names if a <= "20200101" and b >= "20251231"
+        for a, b in names if a <= window_start and b >= window_end
     ]
     if not candidates:
-        raise ValueError(f"No single full-window 2020-2025 ZIP for station {station_id}")
+        raise ValueError(
+            f"No single ZIP spanning {first_year}-{last_year} for station {station_id}"
+        )
     return sorted(set(candidates))[0]
 
 
@@ -283,7 +305,7 @@ def run(root: Path, station_id: str) -> dict:
     CDC server, runs the QC pipeline and writes:
 
     - ``data/raw/``: untouched downloads (station list, station ZIP)
-    - ``data/processed/dwd_<id>_qc_2020_2025.csv.gz``: time-aligned,
+    - ``data/processed/dwd_<id>_qc_<first>_<last>.csv.gz``: time-aligned,
       QC-flagged 10-minute table (missing intervals remain NaN)
     - ``reports/dwd_<id>_validation.json``: provenance (URL, SHA-256),
       measurement conventions and aggregate QC counts
@@ -303,7 +325,7 @@ def run(root: Path, station_id: str) -> dict:
     station_list = raw_dir / STATION_LIST_NAME
     download(ARCHIVE_ROOT + STATION_LIST_NAME, station_list)
     metadata = extract_station_metadata(station_list.read_bytes(), station_id)
-    request = urllib.request.Request(ARCHIVE_ROOT, headers={"User-Agent": "SkyFlux-research/0.1"})
+    request = urllib.request.Request(ARCHIVE_ROOT, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(request, timeout=45) as response:
         archive_name = discover_archive(station_id, response.read().decode("utf-8", errors="replace"))
     archive = raw_dir / archive_name
@@ -331,7 +353,7 @@ def run(root: Path, station_id: str) -> dict:
     # Time-aligned, QC-flagged table; missing intervals remain NaN (no imputation).
     grid[["timestamp_end_utc", "GS_10", "QN", "ghi_wm2", "record_present",
           "measurement_valid", "missing_sentinel", "negative_gs", "suspicious_high"]].to_csv(
-        processed_dir / f"dwd_{station_id}_qc_2020_2025.csv.gz",
+        processed_dir / f"dwd_{station_id}_qc_{FIRST_YEAR}_{LAST_YEAR}.csv.gz",
         compression="gzip", index_label="midpoint_utc"
     )
     save_coverage_figure(daily, fig_dir / f"dwd_{station_id}_monthly_coverage.png")

@@ -31,6 +31,17 @@ def test_archive_discovery():
         discover_archive("00183", html)
 
 
+def test_archive_discovery_custom_window():
+    html = (
+        '<a href="10minutenwerte_SOLAR_00342_20101202_20191231_hist.zip">a</a>'
+        '<a href="10minutenwerte_SOLAR_00342_20200101_20251231_hist.zip">b</a>'
+    )
+    assert (discover_archive("00342", html, 2011, 2019)
+            == "10minutenwerte_SOLAR_00342_20101202_20191231_hist.zip")
+    with pytest.raises(ValueError):
+        discover_archive("00342", html, 2010, 2019)
+
+
 def test_station_metadata_latin1():
     data = "00342 20101202 20251231            103     52.3170    8.1694 Belm                                     Niedersachsen\n".encode("latin-1")
     result = extract_station_metadata(data, "00342")
