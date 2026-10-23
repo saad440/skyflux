@@ -181,7 +181,7 @@ class PPCA:
         self,
         n_components: int = 8,
         seed: int = 0,
-        max_iter: int = 500,
+        max_iter: int = 2000,
         tol: float = 1e-9,
     ):
         self.n_components = int(n_components)
