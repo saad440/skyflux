@@ -98,6 +98,27 @@ def test_build_daily_arrays_rejects_duplicates():
         )
 
 
+def test_build_daily_arrays_rejects_missing_slot_and_skipped_day():
+    index, ghi, g_clear, daylight, *_ = synthetic_two_days()
+    # One dropped daylight timestamp must not be silently encoded as night.
+    keep = index != pd.Timestamp("2020-06-01 09:35Z")
+    with pytest.raises(ValueError, match="complete unique"):
+        build_daily_arrays(index[keep], ghi[keep], g_clear[keep], daylight[keep])
+
+    # A skipped whole day violates the contiguous-day grid contract.
+    third_day = pd.date_range("2020-06-03 00:05", "2020-06-03 23:55", freq="10min", tz="UTC")
+    index3 = index.append(third_day)
+
+    def extend(series):
+        return pd.concat([series, pd.Series(series.iloc[:144].to_numpy(), index=third_day)])
+
+    keep3 = np.asarray(index3.day != 2)
+    with pytest.raises(ValueError, match="contiguous"):
+        build_daily_arrays(
+            index3[keep3], extend(ghi)[keep3], extend(g_clear)[keep3], extend(daylight)[keep3]
+        )
+
+
 def test_daylight_inclusion_screen():
     status = np.full((3, 144), STATUS_NIGHT, dtype=np.int8)
     status[0, :100] = STATUS_DAYLIGHT_VALID  # 100% valid daylight -> included
@@ -122,6 +143,17 @@ def test_chronological_splits_cover_window_exactly():
         chronological_splits(np.append(dates, np.datetime64("2026-01-01", "D")))
 
 
+def test_chronological_splits_reject_overlapping_ranges():
+    dates = pd.date_range("2020-01-01", "2025-12-31", freq="D").to_numpy(dtype="datetime64[D]")
+    overlapping = {
+        "train": (2020, 2023),
+        "validation": (2022, 2024),  # 2022-2023 belong to two splits
+        "test": (2025, 2025),
+    }
+    with pytest.raises(ValueError, match="overlapping"):
+        chronological_splits(dates, splits=overlapping)
+
+
 def test_clear_day_ratio_diagnostic_flags_low_reference():
     index, ghi, g_clear, daylight, *_ = synthetic_two_days()
     # Bias day 1 upwards (clear, reference too low) and day 2 downwards.
@@ -129,6 +161,44 @@ def test_clear_day_ratio_diagnostic_flags_low_reference():
     result = clear_day_ratio_diagnostic(ghi, g_clear, daylight, days_per_year=1)
     assert result["n_days"] == 1  # selects only the clearest day
     assert result["median_ratio"] == pytest.approx(1.2, abs=1e-6)
+
+
+def test_clear_day_ratio_diagnostic_ignores_night_observations():
+    index, ghi, g_clear, daylight, *_ = synthetic_two_days()
+    # Day 1: clear (ratio 1.2) with ordinary night zeros. Day 2: lower
+    # daylight peaks but absurd night values; night observations must not be
+    # able to win the clearest-day selection.
+    ghi[index.day == 1] = (g_clear * 1.2).where(daylight, 0.0)[index.day == 1]
+    ghi[index.day == 2] = (g_clear * 0.6).where(daylight, 3000.0)[index.day == 2]
+    result = clear_day_ratio_diagnostic(ghi, g_clear, daylight, days_per_year=1)
+    assert result["n_days"] == 1
+    assert result["median_ratio"] == pytest.approx(1.2, abs=1e-6)
+
+
+def test_clear_sky_ghi_zeroes_night_and_rejects_daytime_nan(monkeypatch):
+    import pvlib
+
+    times = pd.date_range("2020-06-01 00:05", periods=144, freq="10min", tz="UTC")
+    real = pvlib.location.Location.get_clearsky
+
+    def with_daytime_nan(self, midpoints, model=None):
+        out = real(self, midpoints, model=model).copy()
+        out.loc[times[72], "ghi"] = np.nan  # 12:05 UTC, sun well up in June
+        return out
+
+    monkeypatch.setattr(pvlib.location.Location, "get_clearsky", with_daytime_nan)
+    with pytest.raises(ValueError, match="NaN"):
+        clear_sky_ghi(times, latitude=52.317, longitude=8.1694, elevation_m=103)
+
+    def with_night_nan(self, midpoints, model=None):
+        out = real(self, midpoints, model=model).copy()
+        out.loc[times[0], "ghi"] = np.nan  # 00:05 UTC, sun below the horizon
+        return out
+
+    monkeypatch.setattr(pvlib.location.Location, "get_clearsky", with_night_nan)
+    series = clear_sky_ghi(times, latitude=52.317, longitude=8.1694, elevation_m=103)
+    assert series.loc[times[0]] == 0.0
+    assert series.notna().all()
 
 
 def test_ineichen_clear_sky_belml():

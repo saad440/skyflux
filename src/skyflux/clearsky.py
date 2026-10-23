@@ -54,16 +54,25 @@ def clear_sky_ghi(
     from the monthly climatology bundled with pvlib (Remund et al., SoDA
     world map, interpolated between monthly values by pvlib's default); it is
     an approximate climatology, not a site measurement, so the reference GHI
-    inherits that uncertainty. Values below the horizon are exactly zero.
+    inherits that uncertainty. Values below the horizon are exactly zero; a
+    NaN with the sun up (model failure) raises ``ValueError`` instead of
+    being read as night.
     """
     import pvlib
 
     location = pvlib.location.Location(latitude, longitude, tz="UTC", altitude=elevation_m)
     clear = location.get_clearsky(midpoints_utc, model="ineichen")
     ghi = clear["ghi"]
-    # Below-horizon geometry can in principle produce NaN or tiny negatives
-    # depending on pvlib version; physically the reference is zero.
-    ghi = ghi.fillna(0.0).clip(lower=0.0)
+    # Below the horizon the physical reference is exactly zero; substitute it
+    # there explicitly (some pvlib versions emit NaN for these stamps). A NaN
+    # with the sun up would be a model failure, not night: zeroing it would
+    # silently shrink the daylight mask, so it is rejected instead.
+    below_horizon = location.get_solarposition(midpoints_utc)["apparent_zenith"] >= 90.0
+    ghi = ghi.mask(below_horizon, 0.0)
+    if ghi.isna().any():
+        first_bad = ghi.index[ghi.isna()][0]
+        raise ValueError(f"clear-sky model returned NaN with the sun up at {first_bad}")
+    ghi = ghi.clip(lower=0.0)
     ghi.name = "g_clear_wm2"
     return ghi
 
@@ -79,13 +88,20 @@ def clear_day_ratio_diagnostic(
     """Median observed/clear-sky ratio on the clearest days of each year.
 
     Clearest days are selected per calendar year by the ``quantile`` quantile
-    of valid observed GHI per day (clear days have the highest peaks), then
-    their valid daylight slots are pooled. A median ratio well above 1 means
-    the Ineichen reference with the bundled turbidity climatology is biased
-    low at the site, which inflates k and any k > 1 statistics. This is a
-    diagnostic only; no scaling is fitted or applied here.
+    of valid observed GHI over each day's daylight slots only (night zeros
+    carry no clearness information and would dilute the score by an amount
+    that depends on day length, biasing selection towards long days), then
+    their valid daylight slots are pooled. Days with fewer than
+    ``min_valid_slots`` valid daylight observations are ineligible. Peak
+    irradiance is only a proxy for cloud-free conditions — a brief
+    cloud-enhancement event can also raise a day's peak — so the pooled
+    median over many slots, not any single selected day, is the meaningful
+    quantity. A median ratio well above 1 means the Ineichen reference with
+    the bundled turbidity climatology is biased low at the site, which
+    inflates k and any k > 1 statistics. This is a diagnostic only; no
+    scaling is fitted or applied here.
     """
-    observed = ghi_wm2.dropna()
+    observed = ghi_wm2.where(daylight).dropna()
     per_day = observed.groupby(observed.index.date)
     scores = per_day.quantile(quantile)
     counts = per_day.size()
@@ -138,7 +154,9 @@ def build_daily_arrays(
 
     ``midpoints_utc`` must be a complete, duplicate-free 10-minute grid
     (``00:05 ... 23:55`` UTC, contiguous days), as produced by the DWD QC
-    stage; slots missing from the input would remain NaN with night status.
+    stage. Incomplete grids or skipped whole days raise ``ValueError``: a
+    missing daylight timestamp would otherwise keep the night fill value and
+    escape the daylight inclusion screen as a fake night slot.
 
     Returns a dict with:
 
@@ -166,12 +184,19 @@ def build_daily_arrays(
     days = pd.DatetimeIndex(sorted(day_stamps.unique()))
     # Compare as timezone-free datetime64 arrays (pandas deprecates .values
     # for tz-aware indexes); both sides are UTC wall time.
-    day_position = np.searchsorted(
-        days.tz_convert(None).to_numpy(), day_stamps.tz_convert(None).to_numpy()
-    )
+    day_values = days.tz_convert(None).to_numpy()
+    day_position = np.searchsorted(day_values, day_stamps.tz_convert(None).to_numpy())
     slot = index.hour * 6 + index.minute // 10
     n_days, n_slots = len(days), 144
-    if len(np.unique(day_position * n_slots + slot)) != len(frame):
+    # Unit-independent one-day gap check (index resolution may be us or ns).
+    if n_days > 1 and (np.diff(day_values) != np.timedelta64(1, "D")).any():
+        raise ValueError("midpoint grid skips whole days; days must be contiguous")
+    # Uniqueness of the (day, slot) positions rules out duplicate or off-grid
+    # stamps; combined with the exact count n_days * 144 it proves that every
+    # slot of every day is present exactly once, so no timestamp can be
+    # dropped and read back as a night slot.
+    positions = day_position * n_slots + slot
+    if len(np.unique(positions)) != len(frame) or len(frame) != n_days * n_slots:
         raise ValueError("midpoint grid is not a complete unique 10-minute day grid")
 
     k = cloud_factor(frame["ghi"], frame["g_clear"], frame["daylight"])
@@ -227,7 +252,7 @@ def chronological_splits(dates: np.ndarray, splits: dict = SPLIT_YEARS) -> dict:
     """Boolean day masks for the chronological train/validation/test splits.
 
     ``dates`` is an array of datetime64[D] values. Every date must fall in
-    exactly one split; dates outside the observation window raise
+    exactly one split; unassigned dates and overlapping split ranges raise
     ``ValueError`` so silent split leakage cannot go unnoticed.
     """
     years = pd.DatetimeIndex(dates).year.to_numpy()
@@ -235,11 +260,16 @@ def chronological_splits(dates: np.ndarray, splits: dict = SPLIT_YEARS) -> dict:
         name: (years >= first) & (years <= last)
         for name, (first, last) in splits.items()
     }
-    if not np.logical_or.reduce(list(masks.values())).all():
-        unassigned = pd.DatetimeIndex(dates)[
-            ~np.logical_or.reduce(list(masks.values()))
-        ]
-        raise ValueError(f"dates outside all splits, e.g. {unassigned[0].date()}")
+    # Exactly one split per date: an unassigned date would silently shrink a
+    # split, an overlapping assignment would leak days between splits.
+    n_splits = np.column_stack(list(masks.values())).sum(axis=1)
+    if not (n_splits == 1).all():
+        dates_index = pd.DatetimeIndex(dates)
+        unassigned = dates_index[n_splits == 0]
+        if len(unassigned):
+            raise ValueError(f"dates outside all splits, e.g. {unassigned[0].date()}")
+        overlapping = dates_index[n_splits > 1]
+        raise ValueError(f"overlapping splits, e.g. {overlapping[0].date()}")
     return masks
 
 
