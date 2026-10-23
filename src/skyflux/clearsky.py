@@ -148,9 +148,12 @@ def clearest_days_mask(
     their daylight slots — an observed-peak criterion, because selecting on
     the observed/modelled ratio itself would bias any ratio measured on the
     selected days. The ``days_per_month`` highest-scoring eligible days per
-    calendar month, pooled over all years present, are kept. Month-stratified
-    selection guarantees winter coverage, unlike the per-year selection of
-    ``clear_day_ratio_diagnostic``, which long summer days dominate.
+    calendar month, pooled over all years present, are kept. Month
+    stratification removes the summer dominance of the per-year selection
+    in ``clear_day_ratio_diagnostic``, but it cannot create winter days
+    that fail ``min_valid_slots``: with the default threshold, midwinter
+    days at this latitude have fewer daylight slots than 50 and never
+    qualify, so January and December typically contribute no days.
 
     Returns a boolean Series over ``ghi_wm2.index``, true exactly on valid
     daylight slots of the selected days.
