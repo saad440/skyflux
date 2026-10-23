@@ -14,13 +14,19 @@ from skyflux.clearsky import (
     STATUS_DAYLIGHT_MISSING,
     STATUS_DAYLIGHT_VALID,
     STATUS_NIGHT,
+    apply_reference_scale,
     build_daily_arrays,
     chronological_splits,
     clear_day_ratio_diagnostic,
+    clear_ratio_by_month,
+    clear_ratio_by_reference_bin,
     clear_sky_ghi,
+    clearest_days_mask,
     cloud_factor,
     daily_inclusion,
     daylight_mask,
+    detect_clear_slots,
+    fit_reference_scale,
     k_statistics,
     monthly_k_table,
 )
@@ -241,3 +247,120 @@ def test_k_statistics_and_monthly_table():
     assert table.loc[6, "n"] == 1
     assert table.loc[6, "frac_k_gt_1"] == pytest.approx(1.0)
     assert table.loc[7, "median_k"] == pytest.approx(0.9)
+
+
+def test_clearest_days_mask_and_ratio_tables():
+    index, ghi, g_clear, daylight, *_ = synthetic_two_days()
+    # Day 1 clear with a 20%-high measurement, day 2 overcast.
+    ghi[index.day == 1] = (g_clear * 1.2).where(daylight, 0.0)[index.day == 1]
+    ghi[index.day == 2] = (g_clear * 0.6).where(daylight, 0.0)[index.day == 2]
+    mask = clearest_days_mask(ghi, g_clear, daylight, days_per_month=1)
+
+    # Only the clearest day of the month is selected, its valid daylight slots only.
+    day1 = index.day == 1
+    assert mask.sum() == int((daylight & ghi.notna())[day1].sum())
+    assert not mask[index.day == 2].any()
+
+    monthly = clear_ratio_by_month(mask, ghi, g_clear)
+    assert monthly.loc[6, "n_days"] == 1
+    assert monthly.loc[6, "median_ratio"] == pytest.approx(1.2, abs=1e-6)
+    # A constant ratio must stay flat across g_clear bins: no zenith-dependent bias.
+    bins = clear_ratio_by_reference_bin(mask, ghi, g_clear)
+    assert len(bins) >= 2
+    assert np.allclose(bins["median_ratio"], 1.2, atol=1e-6)
+
+
+def test_clear_ratio_tables_empty_on_no_selection():
+    index = pd.date_range("2020-06-01 00:05", periods=6, freq="10min", tz="UTC")
+    ghi = pd.Series(500.0, index=index)
+    g_clear = pd.Series(400.0, index=index)
+    empty = pd.Series(False, index=index)
+    assert clear_ratio_by_month(empty, ghi, g_clear).empty
+    assert clear_ratio_by_reference_bin(empty, ghi, g_clear).empty
+
+
+def test_detect_clear_slots_plumbing(monkeypatch):
+    import pvlib
+
+    index, ghi, g_clear, daylight, missing_slot, *_ = synthetic_two_days()
+    ghi[missing_slot] = g_clear[missing_slot] * 0.9  # detector needs complete days
+    calls = []
+
+    def fake_detect(measured, clearsky, times=None, infer_limits=False,
+                    return_components=False, **kwargs):
+        calls.append(measured.index[0])
+        n = len(measured)
+        clear = pd.Series(False, index=measured.index)
+        clear.iloc[n // 3 : 2 * n // 3] = True
+        if return_components:
+            return clear, {}, 1.09
+        return clear
+
+    monkeypatch.setattr(pvlib.clearsky, "detect_clearsky", fake_detect)
+    mask, audit = detect_clear_slots(ghi, g_clear, daylight)
+
+    assert len(calls) == 2  # both days have a complete contiguous daylight block
+    assert audit["n_days_evaluated"] == 2
+    assert audit["n_days_with_clear_slots"] == 2
+    assert audit["median_alpha"] == pytest.approx(1.09)
+    assert audit["n_clear_slots"] == int(mask.sum()) > 0
+    assert audit["clear_slots_by_month"][6] == int(mask.sum())
+    assert not (mask & ~daylight).any()  # detections confined to daylight
+
+
+def test_detect_clear_slots_skips_incomplete_days(monkeypatch):
+    import pvlib
+
+    index, ghi, g_clear, daylight, *_ = synthetic_two_days()
+    # Day 1 keeps its missing daylight slot -> skipped; day 2 is evaluated.
+    calls = []
+
+    def fake_detect(measured, clearsky, times=None, infer_limits=False,
+                    return_components=False, **kwargs):
+        calls.append(measured.index[0])
+        return pd.Series(True, index=measured.index), {}, 1.1
+
+    monkeypatch.setattr(pvlib.clearsky, "detect_clearsky", fake_detect)
+    mask, audit = detect_clear_slots(ghi, g_clear, daylight)
+    assert len(calls) == 1
+    assert audit["n_days_evaluated"] == 1
+    assert not mask[index.day == 1].any()
+    assert mask[index.day == 2].any()
+
+
+def test_fit_reference_scale_recovers_constant():
+    index = pd.date_range("2020-06-01 05:05", periods=200, freq="10min", tz="UTC")
+    g_clear = pd.Series(np.linspace(100.0, 800.0, len(index)), index=index)
+    ghi = 1.2 * g_clear
+    marked = pd.Series(index.hour >= 6, index=index)
+    # Unmarked slots carry an extreme ratio: they must not enter the fit.
+    ghi[~marked] = 9.9 * g_clear[~marked]
+    result = fit_reference_scale(marked, ghi, g_clear)
+    assert result["scale"] == pytest.approx(1.2)
+    assert result["g_clear_min_wm2"] == 150.0
+    assert result["n_slots"] == int((marked & (g_clear >= 150.0)).sum())
+    scaled = apply_reference_scale(g_clear, 1.5)
+    assert np.allclose(scaled.to_numpy(), 1.5 * g_clear.to_numpy())
+
+
+def test_fit_reference_scale_requires_enough_slots():
+    index = pd.date_range("2020-06-01 12:05", periods=10, freq="10min", tz="UTC")
+    g_clear = pd.Series(600.0, index=index)
+    ghi = pd.Series(600.0, index=index)
+    with pytest.raises(ValueError, match="cannot calibrate"):
+        fit_reference_scale(pd.Series(True, index=index), ghi, g_clear)
+
+
+def test_build_daily_arrays_with_calibrated_reference():
+    index, ghi, g_clear, daylight, *_ = synthetic_two_days()
+    arrays = build_daily_arrays(
+        index, ghi, g_clear, daylight, g_clear_calibrated=g_clear * 1.1
+    )
+    assert np.allclose(arrays["g_clear_calibrated"], arrays["g_clear"] * 1.1, atol=1e-3)
+    # Same raw daylight mask: k_calibrated is finite exactly where k is.
+    assert np.array_equal(np.isfinite(arrays["k_calibrated"]), np.isfinite(arrays["k"]))
+    valid = arrays["status"] == STATUS_DAYLIGHT_VALID
+    assert np.allclose(arrays["k_calibrated"][valid], arrays["k"][valid] / 1.1, atol=1e-4)
+    # Without a calibrated reference the extra keys are absent.
+    plain = build_daily_arrays(index, ghi, g_clear, daylight)
+    assert "k_calibrated" not in plain

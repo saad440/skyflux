@@ -7,9 +7,11 @@ metadata from the validation report, and writes:
 - ``data/processed/clearsky_<id>_<first>_<last>.csv.gz``: midpoint-level
   measured GHI, clear-sky GHI, daylight mask and k
 - ``data/processed/skyflux_daily_<id>_<first>_<last>.npz``: per-day 144-slot
-  matrices (k, GHI, G_clear, status codes), inclusion flags and split ids
+  matrices (k, GHI, G_clear, status codes, the calibrated reference and its
+  k), inclusion flags and split ids
 - ``reports/clearsky_<id>_report.json``: provenance, daylight-threshold
-  effect, screen comparison and k diagnostics
+  effect, screen comparison, k diagnostics, and the clear-sky reference
+  calibration with per-split transfer ratios
 - ``reports/clearsky_<id>_monthly.csv``: monthly k and daylight statistics
 - ``reports/clearsky_<id>_yearly_inclusion.csv``: retained days per year
   under both completeness screens
@@ -25,18 +27,25 @@ import numpy as np
 import pandas as pd
 
 from skyflux.clearsky import (
+    CALIBRATION_G_CLEAR_MIN_WM2,
     DAYLIGHT_G_CLEAR_THRESHOLD_WM2,
     SPLIT_YEARS,
     STATUS_DAYLIGHT_MISSING,
     STATUS_DAYLIGHT_VALID,
     STATUS_NIGHT,
-    clear_day_ratio_diagnostic,
+    apply_reference_scale,
     build_daily_arrays,
     chronological_splits,
+    clear_day_ratio_diagnostic,
+    clear_ratio_by_month,
+    clear_ratio_by_reference_bin,
     clear_sky_ghi,
+    clearest_days_mask,
     cloud_factor,
     daily_inclusion,
     daylight_mask,
+    detect_clear_slots,
+    fit_reference_scale,
     k_statistics,
     monthly_k_table,
 )
@@ -132,7 +141,25 @@ def main():
     daylight = daylight_mask(g_clear)
     k = cloud_factor(grid["ghi_wm2"], g_clear, daylight)
 
-    arrays = build_daily_arrays(grid.index, grid["ghi_wm2"], g_clear, daylight)
+    # Clear-condition diagnostics and the reference calibration. Everything
+    # that feeds the calibration (detector clear slots) is restricted to the
+    # training years; later years enter only as transfer diagnostics.
+    train_range = SPLIT_YEARS["train"]
+    in_train = (grid.index.year >= train_range[0]) & (grid.index.year <= train_range[1])
+    clear_day_mask_all = clearest_days_mask(grid["ghi_wm2"], g_clear, daylight)
+    clear_day_mask_train = clearest_days_mask(
+        grid["ghi_wm2"][in_train], g_clear[in_train], daylight[in_train]
+    )
+    detector_mask, detector_audit = detect_clear_slots(
+        grid["ghi_wm2"][in_train], g_clear[in_train], daylight[in_train]
+    )
+    calibration = fit_reference_scale(detector_mask, grid["ghi_wm2"], g_clear)
+    g_clear_cal = apply_reference_scale(g_clear, calibration["scale"])
+    k_cal = cloud_factor(grid["ghi_wm2"], g_clear_cal, daylight)
+
+    arrays = build_daily_arrays(
+        grid.index, grid["ghi_wm2"], g_clear, daylight, g_clear_calibrated=g_clear_cal
+    )
     inclusion = daily_inclusion(arrays["status"])
 
     # Merge the QC duplicate-day flag and compare with the earlier full-day
@@ -162,6 +189,8 @@ def main():
         ghi=arrays["ghi"],
         g_clear=arrays["g_clear"],
         status=arrays["status"],
+        g_clear_calibrated=arrays["g_clear_calibrated"],
+        k_calibrated=arrays["k_calibrated"],
         include_day=inclusion["include_day"].to_numpy(),
         split_id=split_id,
     )
@@ -170,8 +199,10 @@ def main():
         {
             "ghi_wm2": grid["ghi_wm2"],
             "g_clear_wm2": g_clear,
+            "g_clear_calibrated_wm2": g_clear_cal,
             "daylight": daylight,
             "k": k,
+            "k_calibrated": k_cal,
         }
     ).to_csv(
         processed / f"clearsky_{station_id}_{FIRST_YEAR}_{LAST_YEAR}.csv.gz",
@@ -201,6 +232,55 @@ def main():
     dayl = inclusion["include_day"].to_numpy()
     k_stats = k_statistics(arrays["k"])
     bias = clear_day_ratio_diagnostic(grid["ghi_wm2"], g_clear, daylight)
+
+    # Clear-condition reference-bias decomposition (measurement only).
+    bias_tables = {
+        "clearest_days_train_years": clear_ratio_by_month(
+            clear_day_mask_train, grid["ghi_wm2"], g_clear
+        ),
+        "detector_train_years": clear_ratio_by_month(
+            detector_mask, grid["ghi_wm2"], g_clear
+        ),
+        "clearest_days_all_years": clear_ratio_by_month(
+            clear_day_mask_all, grid["ghi_wm2"], g_clear
+        ),
+    }
+    bias_bins = {
+        "clearest_days_train_years": clear_ratio_by_reference_bin(
+            clear_day_mask_train, grid["ghi_wm2"], g_clear
+        ),
+        "detector_train_years": clear_ratio_by_reference_bin(
+            detector_mask, grid["ghi_wm2"], g_clear
+        ),
+    }
+
+    def table_to_records(table: pd.DataFrame) -> dict:
+        return json.loads(table.to_json(orient="index", double_precision=10))
+
+    # Per-split evaluation of the calibration: the training ratios are
+    # construction checks, 2024/2025 are transfer checks computed from data
+    # that never entered the fit.
+    ratio_cal = grid["ghi_wm2"] / g_clear_cal
+    usable_cal = ratio_cal.notna() & (g_clear >= CALIBRATION_G_CLEAR_MIN_WM2)
+    year = grid.index.year
+    calibrated_by_split = {}
+    for name, (first, last) in SPLIT_YEARS.items():
+        in_split = (year >= first) & (year <= last)
+        split_clear = clearest_days_mask(
+            grid["ghi_wm2"][in_split], g_clear[in_split], daylight[in_split]
+        )
+        slots = usable_cal & split_clear
+        calibrated_by_split[name] = {
+            "median_ratio_clearest_days": (
+                float(ratio_cal[slots].median()) if slots.any() else None
+            ),
+            "n_slots": int(slots.sum()),
+        }
+    calibrated_by_split["train"]["median_ratio_detector_slots"] = float(
+        ratio_cal[usable_cal & detector_mask].median()
+    )
+    k_cal_stats = k_statistics(arrays["k_calibrated"])
+
     monthly_k_stats = {
         str(month): {key: float(value) for key, value in row.items()}
         for month, row in monthly.iterrows()
@@ -238,6 +318,20 @@ def main():
             name: int((dayl & masks[name]).sum()) for name in SPLIT_YEARS
         },
         "reference_bias_diagnostic": bias,
+        "reference_bias_by_month": {
+            name: table_to_records(table) for name, table in bias_tables.items()
+        },
+        "reference_ratio_by_gclear_bin": {
+            name: table_to_records(table) for name, table in bias_bins.items()
+        },
+        "clear_slot_detection_train_years": detector_audit,
+        "reference_calibration": {
+            "method": "constant multiplicative scale: median observed/clear-sky ratio on Reno & Hansen detector clear slots (pvlib detect_clearsky, infer_limits=True), training years only",
+            **calibration,
+            "residuals_not_fitted": "slots below the G_clear floor (low-sun dawn/dusk regime) and deep-winter Dec/Jan detector slots (medians 0.6-0.75, contamination-limited by the detector's absolute thresholds at winter magnitudes)",
+        },
+        "calibrated_clear_ratio_by_split": calibrated_by_split,
+        "k_statistics_calibrated": k_cal_stats,
         "k_statistics": k_stats,
         "k_statistics_by_month": monthly_k_stats,
     }
@@ -284,8 +378,25 @@ def main():
           {name: int((dayl & masks[name]).sum()) for name in SPLIT_YEARS})
     print(f"Clearest-day median G/G_clear: {bias['median_ratio']:.3f} "
           f"(reference-bias diagnostic; 1.0 = unbiased)")
+    for name, table in bias_tables.items():
+        medians = table["median_ratio"]
+        if len(medians):
+            print(f"Clear-condition median ratio by month ({name}): min {medians.min():.3f} / "
+                  f"max {medians.max():.3f} (span {medians.max() - medians.min():.3f})")
+    print(f"Detector (train years): {detector_audit['n_clear_slots']} clear slots on "
+          f"{detector_audit['n_days_with_clear_slots']}/{detector_audit['n_days_evaluated']} days, "
+          f"median alpha {detector_audit['median_alpha']}")
+    print(f"Reference calibration: scale {calibration['scale']:.4f} fitted on "
+          f"{calibration['n_slots']} detector slots (train years, "
+          f"G_clear >= {CALIBRATION_G_CLEAR_MIN_WM2:.0f} W/m^2)")
+    print("Calibrated clear-day median ratio by split:", {
+        name: values["median_ratio_clearest_days"]
+        for name, values in calibrated_by_split.items()
+    })
     print(f"k>1: {k_stats['fraction_k_gt_1']:.3%}; k>1.05: "
           f"{k_stats['fraction_k_gt_1_05']:.3%}; median k: {k_stats['median']:.3f}")
+    print(f"k_cal>1: {k_cal_stats['fraction_k_gt_1']:.3%}; k_cal>1.05: "
+          f"{k_cal_stats['fraction_k_gt_1_05']:.3%}; median k_cal: {k_cal_stats['median']:.3f}")
     print(f"Outputs: {processed / f'skyflux_daily_{station_id}_{FIRST_YEAR}_{LAST_YEAR}.npz'}, "
           f"{report_dir / f'clearsky_{station_id}_report.json'}, "
           f"{root / 'figures' / f'clearsky_{station_id}_diagnostics.png'}")
