@@ -15,6 +15,15 @@ Writes ``reports/final_evaluation_2025.json`` and
 ``figures/final_evaluation_2025.png``. Development variants (VAE beta=1,
 beta=0.1) remain documented in ``reports/vae_validation.json`` and are
 not part of the frozen comparison.
+
+Also exports notebook assets under ``notebooks/assets/``:
+``final_2025_profiles.npz`` (per-collection DayCollection arrays — dates,
+k, validity mask and calibrated clear-sky reference for the observed year
+and every generated ensemble, nonphysical generated values untouched) and
+``final_2025_summary.json`` (the report's summary metrics), so notebooks
+can plot the frozen results without retraining or resampling. The export
+reloads the written arrays and recomputes every collection's metrics; the
+run fails unless they reproduce the report exactly.
 """
 from __future__ import annotations
 
@@ -150,6 +159,44 @@ def save_figure(target: Path, collections: dict, labels: dict) -> None:
     plt.close(fig)
 
 
+def export_notebook_assets(
+    assets_dir: Path, collections: dict, report: dict, training_pool: DayCollection
+) -> None:
+    """Write the DayCollection arrays and summary metrics for the notebooks.
+
+    Keys are ``<collection>__dates``, ``__k``, ``__valid`` and
+    ``__g_clear_cal`` plus a ``collection_names`` index array. k and the
+    clear-sky reference are stored float32: every value in these
+    collections originates from the float32 daily arrays (``from_dataset``
+    and ``from_generated`` only widen to float64), so the narrowing is
+    lossless and generated nonphysical values survive bit-exactly. After
+    writing, each collection is rebuilt from the file and re-summarized;
+    any metric that fails to reproduce the report exactly aborts the run,
+    so the assets cannot silently drift from the published numbers.
+    """
+    arrays = {"collection_names": np.asarray(list(collections))}
+    for name, collection in collections.items():
+        arrays[f"{name}__dates"] = collection.dates
+        arrays[f"{name}__k"] = collection.k.astype(np.float32)
+        arrays[f"{name}__valid"] = collection.valid
+        arrays[f"{name}__g_clear_cal"] = collection.g_clear_cal.astype(np.float32)
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    profiles_path = assets_dir / "final_2025_profiles.npz"
+    np.savez_compressed(profiles_path, **arrays)
+    (assets_dir / "final_2025_summary.json").write_text(json.dumps(report, indent=2))
+
+    reloaded = np.load(profiles_path)
+    for name in collections:
+        rebuilt = DayCollection(
+            dates=reloaded[f"{name}__dates"],
+            k=reloaded[f"{name}__k"].astype(np.float64),
+            valid=reloaded[f"{name}__valid"],
+            g_clear_cal=reloaded[f"{name}__g_clear_cal"].astype(np.float64),
+        )
+        if summarize_collection(rebuilt, training_pool) != report["collections"][name]:
+            raise SystemExit(f"notebook asset check failed: {name!r} metrics not reproduced")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--station", default="00342", help="Five-digit DWD station ID")
@@ -206,6 +253,8 @@ def main():
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(report, indent=2))
     save_figure(root / "figures" / "final_evaluation_2025.png", collections, labels)
+    assets_dir = root / "notebooks" / "assets"
+    export_notebook_assets(assets_dir, collections, report, training_pool)
 
     for name, (color, label) in labels.items():
         summary = report["collections"][name]
@@ -220,6 +269,8 @@ def main():
               f"lag-1 {summary['autocorrelation_k'][1]:.3f} | "
               f"NN-RMS med {nn['median']:.3f}")
     print(f"Outputs: {report_path}, {root / 'figures' / 'final_evaluation_2025.png'}")
+    print(f"Notebook assets: {assets_dir / 'final_2025_profiles.npz'}, "
+          f"{assets_dir / 'final_2025_summary.json'} (metrics re-verified from the written file)")
 
 
 if __name__ == "__main__":
