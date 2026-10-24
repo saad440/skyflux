@@ -26,6 +26,16 @@ def test_vae_training_is_deterministic():
         assert a.date == b.date
 
 
+def test_vae_beta_weights_kl():
+    vae = DailyVAE(latent_dim=2, hidden=(16, 8), seed=0, beta=0.0)
+    x = torch.rand(2, 144)
+    mask = torch.ones(2, 144)
+    torch.manual_seed(1)
+    total, mse, kl = vae._model.loss_terms(x, mask, beta=vae.beta)
+    assert kl.item() > 0
+    assert total.item() == pytest.approx(mse.item())  # beta = 0 drops the KL
+
+
 def test_vae_loss_ignores_invalid_slots():
     vae = DailyVAE(latent_dim=2, hidden=(16, 8), seed=0)
     x = torch.zeros(2, 144)

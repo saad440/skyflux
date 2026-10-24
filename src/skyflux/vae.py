@@ -7,16 +7,25 @@ slots, and generated 144-vectors become physical only through a reference
 date's daylight mask (``GeneratedDay``). Values are never clipped — the
 decoder may emit negative or extreme k and the evaluation reports them.
 
-Generative model: encoder ``q(z|x) = N(mu(x), diag(exp(logvar(x))))`),
-standard normal prior, Gaussian decoder with unit variance (so the
-reconstruction term is a masked MSE). The evidence lower bound is
+Generative model: encoder ``q(z|x) = N(mu(x), diag(exp(logvar(x))))``,
+standard-normal prior, Gaussian decoder with fixed unit variance. The
+training objective is a beta-weighted, per-day-normalized variational
+bound
 
-    L = E_q[ ||x_obs - f(z)_obs||^2 / m ] + KL(q(z|x) || N(0, I)),
+    L = E_q[ ||x_obs - f(z)_obs||^2 / m ] + beta * KL(q(z|x) || N(0, I)),
 
-normalized per day (m = the day's valid slot count) so long summer days
-do not dominate short winter ones. Training is CPU-seeded and
-deterministic: fixed torch seed at construction, a seeded numpy generator
-for minibatch shuffling and sampling.
+not the plain evidence lower bound: the per-day normalization (m = the
+day's valid slot count) reweights the data so each day, not each slot,
+contributes equally (days are the generation unit), and beta rescales
+the KL. With a Gaussian decoder of variance sigma^2 the exact ELBO
+weights the reconstruction by 1/(2 sigma^2); this objective therefore
+corresponds to an implied sigma^2 = beta / 2. The residual variance of
+k around the masked mean is ~0.15, so the variance-matched choice is
+beta ~ 0.3; beta = 1 (the original variant) is correspondingly KL-heavy
+and collapses to the mean profile, while beta < 1 forces the latent to
+carry information. Training is CPU-seeded and deterministic: fixed torch
+seed at construction, a seeded numpy generator for minibatch shuffling
+and sampling.
 """
 from __future__ import annotations
 
@@ -65,8 +74,8 @@ class _MLPVAE(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return self.decoder(z)
 
-    def loss_terms(self, x: torch.Tensor, mask: torch.Tensor):
-        """Masked per-day MSE and KL divergence, both averaged over days.
+    def loss_terms(self, x: torch.Tensor, mask: torch.Tensor, beta: float = 1.0):
+        """Masked per-day MSE and beta-weighted KL, averaged over days.
 
         Invalid slots are zeroed on the input here so the encoder can
         never see them, regardless of what the caller passes; the mask
@@ -81,7 +90,7 @@ class _MLPVAE(nn.Module):
         per_day_mse = (((reconstruction - x) ** 2) * mask).sum(dim=1) / slot_count
         mse = per_day_mse.mean()
         kl = (-0.5 * (1.0 + logvar - mean**2 - torch.exp(logvar))).sum(dim=1).mean()
-        return mse + kl, mse, kl
+        return mse + beta * kl, mse, kl
 
 
 class DailyVAE:
@@ -99,10 +108,12 @@ class DailyVAE:
         latent_dim: int = LATENT_DIM,
         hidden: tuple[int, ...] = HIDDEN_DIMS,
         seed: int = 0,
+        beta: float = 1.0,
     ):
         self.latent_dim = int(latent_dim)
         self.hidden = tuple(hidden)
         self.seed = int(seed)
+        self.beta = float(beta)
         torch.manual_seed(self.seed)
         self._model = _MLPVAE(self.latent_dim, self.hidden)
         self._rng = np.random.default_rng(self.seed)
@@ -129,7 +140,7 @@ class DailyVAE:
             for start in range(0, n_days, int(batch_size)):
                 rows = torch.tensor(order[start : start + int(batch_size)])
                 optimizer.zero_grad()
-                loss, mse, kl = self._model.loss_terms(x[rows], mask[rows])
+                loss, mse, kl = self._model.loss_terms(x[rows], mask[rows], beta=self.beta)
                 loss.backward()
                 optimizer.step()
                 epoch_mse += mse.item()
@@ -196,6 +207,7 @@ class DailyVAE:
                     "latent_dim": self.latent_dim,
                     "hidden": list(self.hidden),
                     "seed": self.seed,
+                    "beta": self.beta,
                 },
             },
             path,
@@ -209,6 +221,7 @@ class DailyVAE:
             latent_dim=config["latent_dim"],
             hidden=tuple(config["hidden"]),
             seed=seed,
+            beta=config.get("beta", 1.0),
         )
         instance._model.load_state_dict(payload["state_dict"])
         return instance
