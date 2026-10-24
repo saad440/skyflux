@@ -17,15 +17,19 @@ bound
 not the plain evidence lower bound: the per-day normalization (m = the
 day's valid slot count) reweights the data so each day, not each slot,
 contributes equally (days are the generation unit), and beta rescales
-the KL. With a Gaussian decoder of variance sigma^2 the exact ELBO
-weights the reconstruction by 1/(2 sigma^2); this objective therefore
-corresponds to an implied sigma^2 = beta / 2. The residual variance of
-k around the masked mean is ~0.15, so the variance-matched choice is
-beta ~ 0.3; beta = 1 (the original variant) is correspondingly KL-heavy
-and collapses to the mean profile, while beta < 1 forces the latent to
-carry information. Training is CPU-seeded and deterministic: fixed torch
-seed at construction, a seeded numpy generator for minibatch shuffling
-and sampling.
+the KL. Matching term by term against the exact Gaussian ELBO shows the
+implied observation variance is day-dependent: per unit of summed
+squared error the exact ELBO weights the KL by 2 sigma^2, while this
+objective weights it by beta * m, so the implied variance is
+sigma^2 = beta * m / 2. Equal day weighting and a single exact-ELBO
+scale are therefore incompatible: the variance-matched choice is a
+per-day weight beta_i = 2 * sigma_hat^2 / m_i with sigma_hat^2 the
+empirical residual variance of k (~0.15 here; pass ``sigma2`` to enable
+this mode). A constant beta = 1 implies sigma^2 of 20-45 W/m^2-scale —
+far above the residual, which is why that variant posterior-collapses.
+Training is CPU-seeded and deterministic: fixed torch seed at
+construction, a seeded numpy generator for minibatch shuffling and
+sampling.
 """
 from __future__ import annotations
 
@@ -74,9 +78,11 @@ class _MLPVAE(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return self.decoder(z)
 
-    def loss_terms(self, x: torch.Tensor, mask: torch.Tensor, beta: float = 1.0):
+    def loss_terms(self, x: torch.Tensor, mask: torch.Tensor, beta=1.0):
         """Masked per-day MSE and beta-weighted KL, averaged over days.
 
+        ``beta`` is either a scalar or a per-day tensor (the
+        variance-matched mode uses ``2 * sigma^2 / m_i`` per day).
         Invalid slots are zeroed on the input here so the encoder can
         never see them, regardless of what the caller passes; the mask
         additionally zeroes the reconstruction loss on those slots.
@@ -89,8 +95,13 @@ class _MLPVAE(nn.Module):
         slot_count = mask.sum(dim=1).clamp(min=1.0)
         per_day_mse = (((reconstruction - x) ** 2) * mask).sum(dim=1) / slot_count
         mse = per_day_mse.mean()
-        kl = (-0.5 * (1.0 + logvar - mean**2 - torch.exp(logvar))).sum(dim=1).mean()
-        return mse + beta * kl, mse, kl
+        kl_per_day = (-0.5 * (1.0 + logvar - mean**2 - torch.exp(logvar))).sum(dim=1)
+        kl = kl_per_day.mean()
+        if torch.is_tensor(beta):
+            total = mse + (beta * kl_per_day).mean()
+        else:
+            total = mse + beta * kl
+        return total, mse, kl
 
 
 class DailyVAE:
@@ -109,11 +120,15 @@ class DailyVAE:
         hidden: tuple[int, ...] = HIDDEN_DIMS,
         seed: int = 0,
         beta: float = 1.0,
+        sigma2: float | None = None,
     ):
         self.latent_dim = int(latent_dim)
         self.hidden = tuple(hidden)
         self.seed = int(seed)
         self.beta = float(beta)
+        # Variance-matched mode: per-day KL weights 2*sigma2/m_i (exact
+        # ELBO scale per day, equal day weighting preserved).
+        self.sigma2 = None if sigma2 is None else float(sigma2)
         torch.manual_seed(self.seed)
         self._model = _MLPVAE(self.latent_dim, self.hidden)
         self._rng = np.random.default_rng(self.seed)
@@ -140,7 +155,11 @@ class DailyVAE:
             for start in range(0, n_days, int(batch_size)):
                 rows = torch.tensor(order[start : start + int(batch_size)])
                 optimizer.zero_grad()
-                loss, mse, kl = self._model.loss_terms(x[rows], mask[rows], beta=self.beta)
+                if self.sigma2 is not None:
+                    beta = 2.0 * self.sigma2 / mask[rows].sum(dim=1).clamp(min=1.0)
+                else:
+                    beta = self.beta
+                loss, mse, kl = self._model.loss_terms(x[rows], mask[rows], beta=beta)
                 loss.backward()
                 optimizer.step()
                 epoch_mse += mse.item()
@@ -208,6 +227,7 @@ class DailyVAE:
                     "hidden": list(self.hidden),
                     "seed": self.seed,
                     "beta": self.beta,
+                    "sigma2": self.sigma2,
                 },
             },
             path,
@@ -222,6 +242,7 @@ class DailyVAE:
             hidden=tuple(config["hidden"]),
             seed=seed,
             beta=config.get("beta", 1.0),
+            sigma2=config.get("sigma2"),
         )
         instance._model.load_state_dict(payload["state_dict"])
         return instance

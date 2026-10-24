@@ -4,10 +4,12 @@ Trains the small seeded MLP VAE (CPU) on the 2020-2023 included days only,
 saves the models under ``models/`` (gitignored), samples validation-year
 ensembles bound to 2024 reference dates and writes
 ``reports/vae_validation.json`` using the same masked metrics as the
-baselines. Both beta variants are trained under identical conditions
-(seed, epochs, architecture): beta = 1 (the original, posterior-collapsed
-variant) and beta = 0.1 (KL down-weighted). The test year 2025 is not
-touched.
+baselines. Three variants are trained under identical conditions (seed,
+epochs, architecture): constant beta = 1 (the original, posterior-
+collapsed variant), constant beta = 0.1, and the variance-matched loss
+with per-day KL weights 2 * sigma_hat^2 / m_i where sigma_hat^2 is the
+training residual variance of k around its masked mean. The test year
+2025 is not touched.
 """
 from __future__ import annotations
 
@@ -15,13 +17,14 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
+
 from skyflux.baselines import load_daily_dataset
 from skyflux.dwd import FIRST_YEAR, LAST_YEAR
 from skyflux.evaluation import DayCollection, summarize_collection
 from skyflux.vae import LATENT_DIM, EPOCHS, DailyVAE
 
 SEED = 0
-BETAS = (1.0, 0.1)
 
 
 def main():
@@ -42,19 +45,27 @@ def main():
     validation = dataset.subset("validation")
 
     training = DayCollection.from_dataset(train)
+    masked_mean = np.nanmean(np.where(train.valid, train.k, np.nan), axis=0)
+    sigma2_hat = float(np.nanmean(np.where(train.valid, (train.k - masked_mean) ** 2, np.nan)))
+
+    configurations = (
+        ("beta_1.0", {"beta": 1.0}),
+        ("beta_0.1", {"beta": 0.1}),
+        ("variance_matched", {"sigma2": sigma2_hat}),
+    )
     variants = {}
-    for beta in BETAS:
-        vae = DailyVAE(latent_dim=args.latent_dim, seed=SEED, beta=beta).fit(
+    for name, kwargs in configurations:
+        vae = DailyVAE(latent_dim=args.latent_dim, seed=SEED, **kwargs).fit(
             train, epochs=args.epochs
         )
-        model_path = root / "models" / f"vae_q{args.latent_dim}_seed{SEED}_beta{beta}.pt"
+        model_path = root / "models" / f"vae_q{args.latent_dim}_seed{SEED}_{name}.pt"
         vae.save(model_path)
-        variants[beta] = {
+        variants[name] = {
             "fit": {
                 "years": "2020-2023 (training only)",
                 "latent_dim": args.latent_dim,
                 "seed": SEED,
-                "beta": beta,
+                **kwargs,
                 "epochs": args.epochs,
                 "final_train_mse": vae.history[-1]["mse"],
                 "final_train_kl": vae.history[-1]["kl"],
@@ -70,8 +81,9 @@ def main():
 
     report = {
         "representation": "k_calibrated 144-slot daily vectors; geometry from 2024 reference dates",
-        "note": "beta = 1 is the original (posterior-collapsed) variant; beta = 0.1 down-weights the KL; identical seeds, epochs and architecture",
-        **{f"vae_beta_{beta}": variant for beta, variant in variants.items()},
+        "note": "identical seeds, epochs and architecture; beta = 1 is the original posterior-collapsed variant, beta = 0.1 a constant down-weighting, variance_matched uses per-day KL weights 2*sigma_hat^2/m_i (exact ELBO scale per day; sigma_hat^2 from training data only)",
+        "sigma2_hat": sigma2_hat,
+        **{f"vae_{name}": variant for name, variant in variants.items()},
     }
     report_path = root / "reports" / "vae_validation.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,13 +96,14 @@ def main():
         for name in ("observed_2024", "bootstrap", "ppca_q8"):
             reference_rows[name] = baselines[name]
 
-    for beta, variant in variants.items():
+    for name, variant in variants.items():
         fit = variant["fit"]
-        print(f"VAE q={args.latent_dim} beta={beta} ({args.epochs} epochs): "
+        setting = f"beta={fit.get('beta')}" if "beta" in fit else f"sigma2={fit['sigma2']:.4f}"
+        print(f"VAE q={args.latent_dim} {setting} ({args.epochs} epochs): "
               f"train mse {fit['final_train_mse']:.5f}, kl {fit['final_train_kl']:.2f}, "
               f"val recon mse {fit['validation_reconstruction_mse']:.5f}")
     rows = list(reference_rows.items()) + [
-        (f"vae beta={beta}", variant["generated"]) for beta, variant in variants.items()
+        (f"vae {name}", variant["generated"]) for name, variant in variants.items()
     ]
     for name, summary in rows:
         k = summary["k"]

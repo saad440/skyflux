@@ -26,6 +26,23 @@ def test_vae_training_is_deterministic():
         assert a.date == b.date
 
 
+def test_vae_variance_matched_per_day_weights():
+    vae = DailyVAE(latent_dim=2, hidden=(16, 8), seed=0, sigma2=0.15)
+    x = torch.rand(2, 144)
+    mask = torch.zeros(2, 144)
+    mask[0, :40] = 1.0
+    mask[1, :90] = 1.0
+    weights = 2.0 * 0.15 / mask.sum(dim=1)
+    total, mse, kl = vae._model.loss_terms(x, mask, beta=weights)
+    assert torch.isfinite(total)
+    # Fewer valid slots -> cheaper KL for that day (weight 2 sigma^2 / m).
+    assert weights[0] > weights[1]
+    # The scalar path keeps its meaning.
+    torch.manual_seed(0)
+    total, mse, kl = vae._model.loss_terms(x, mask, beta=0.1)
+    assert total.item() == pytest.approx(mse.item() + 0.1 * kl.item())
+
+
 def test_vae_beta_weights_kl():
     vae = DailyVAE(latent_dim=2, hidden=(16, 8), seed=0, beta=0.0)
     x = torch.rand(2, 144)
