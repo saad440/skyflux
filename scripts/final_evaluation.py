@@ -36,8 +36,13 @@ SEED = 0
 N_COMPONENTS = 8
 
 
-def collections_for_test(train, test, root: Path) -> dict:
-    """Frozen generators, each sampled as a test-year-sized ensemble."""
+def collections_for_test(train, test, root: Path) -> tuple[dict, float]:
+    """Frozen generators as test-year-sized ensembles, plus sigma_hat^2.
+
+    The residual variance is returned for the report's frozen-configuration
+    record; the VAE either loads the saved model or refits deterministically
+    with it.
+    """
     n_days = len(test.dates)
 
     ppca = PPCA(n_components=N_COMPONENTS, seed=SEED).fit(train)
@@ -75,7 +80,7 @@ def collections_for_test(train, test, root: Path) -> dict:
     }
     generated = {name: DayCollection.from_generated(days) for name, days in ensembles.items()}
     generated["observed_2025"] = DayCollection.from_dataset(test)
-    return generated
+    return generated, sigma2_hat
 
 
 def save_figure(target: Path, collections: dict, labels: dict) -> None:
@@ -113,10 +118,7 @@ def save_figure(target: Path, collections: dict, labels: dict) -> None:
     ax = axes[1, 0]
     bins = np.linspace(0.0, 400.0, 41)
     for name, (color, label) in labels.items():
-        collection = collections[name]
-        values = np.abs(np.diff(collection.ghi(), axis=1))[
-            collection.valid[:, :-1] & collection.valid[:, 1:]
-        ]
+        values = ramp_magnitudes(collections[name])
         ax.hist(values, bins=bins, density=True, histtype="step", linewidth=1.5,
                 label=label, color=color)
     ax.set_yscale("log")
@@ -160,7 +162,7 @@ def main():
     train = dataset.subset("train")
     test = dataset.subset("test")
 
-    collections = collections_for_test(train, test, root)
+    collections, sigma2_hat = collections_for_test(train, test, root)
     training_pool = DayCollection.from_dataset(train)
     labels = {
         "observed_2025": ("tab:blue", "observed 2025"),
@@ -173,10 +175,25 @@ def main():
     report = {
         "protocol": (
             "held-out 2025 test year; all models fitted on 2020-2023 only; "
-            "frozen configurations, fixed seeds, no tuning on test data; "
-            "ensembles sampled against 2025 reference dates"
+            "frozen configurations, fixed seeds, no tuning on test data. "
+            "PPCA/VAE ensembles are bound to randomly drawn 2025 reference "
+            "dates (geometry assigned, cloudiness modelled); the bootstrap "
+            "resamples whole training days and therefore carries its own "
+            "training-date geometry and training-period weather, which is "
+            "inherent to the method."
         ),
         "n_test_days": int(len(test.dates)),
+        "frozen_configurations": {
+            "seed": SEED,
+            "ppca": {"n_components": N_COMPONENTS, "residual_variant": "isotropic sigma"},
+            "vae": {
+                "latent_dim": N_COMPONENTS,
+                "epochs": EPOCHS,
+                "kl_weights": "2 * sigma_hat^2 / m_i",
+                "sigma_hat^2": sigma2_hat,
+            },
+            "ensemble_size_days": int(len(test.dates)),
+        },
         "collections": {
             name: summarize_collection(collection, training_pool)
             for name, collection in collections.items()

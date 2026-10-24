@@ -21,6 +21,7 @@ from skyflux.evaluation import (
     DayCollection,
     autocorrelation_k,
     daily_energy,
+    ramp_magnitudes,
     summarize_collection,
 )
 
@@ -68,9 +69,7 @@ def save_figure(target: Path, real, bootstrap, ppca) -> None:
     ax = axes[1, 0]
     bins = np.linspace(0.0, 400.0, 41)
     for collection, label, color in series:
-        values = np.abs(
-            np.diff(collection.ghi(), axis=1)
-        )[collection.valid[:, :-1] & collection.valid[:, 1:]]
+        values = ramp_magnitudes(collection)
         ax.hist(values, bins=bins, density=True, histtype="step", linewidth=1.5,
                 label=label, color=color)
     ax.set_yscale("log")
