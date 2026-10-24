@@ -5,8 +5,11 @@ memorization floor, PPCA q=8 with and without its isotropic residual, and
 the variance-matched VAE. Every generator was fitted on 2020-2023 only;
 nothing about 2025 informed any model or configuration choice, and this
 script performs no tuning — it fits the frozen configurations
-deterministically from fixed seeds, samples ensembles bound to 2025
-reference dates and compares them with the masked metrics.
+deterministically from fixed seeds and samples generator ensembles: the
+bootstrap resamples whole training days (carrying their own dates and
+geometry, inherent to the method), while PPCA/VAE bind generated profiles
+to randomly drawn 2025 reference dates. All collections are compared with
+the masked metrics.
 
 Writes ``reports/final_evaluation_2025.json`` and
 ``figures/final_evaluation_2025.png``. Development variants (VAE beta=1,
